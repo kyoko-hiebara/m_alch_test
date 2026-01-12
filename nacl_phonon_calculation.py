@@ -264,6 +264,75 @@ def analyze_gamma_splitting(results, name):
     return freqs_sorted
 
 
+def optimize_structure(atoms, calc, name, fmax=0.01):
+    """
+    Optimize atomic positions and lattice parameters.
+    
+    Returns optimized atoms copy.
+    """
+    from ase.optimize import BFGS
+    from ase.constraints import StrainFilter
+    
+    print(f"\n{'='*40}")
+    print(f"Optimizing structure with {name}")
+    print(f"{'='*40}")
+    
+    atoms = atoms.copy()
+    atoms.calc = calc
+    
+    # Initial state
+    e_init = atoms.get_potential_energy()
+    cell_init = atoms.cell.lengths()
+    print(f"Initial energy: {e_init:.4f} eV")
+    print(f"Initial cell: {cell_init}")
+    
+    # Optimize lattice + positions using StrainFilter
+    sf = StrainFilter(atoms)
+    opt = BFGS(sf, logfile=f'opt_{name}.log')
+    opt.run(fmax=fmax)
+    
+    # Final state
+    e_final = atoms.get_potential_energy()
+    cell_final = atoms.cell.lengths()
+    print(f"Final energy: {e_final:.4f} eV")
+    print(f"Final cell: {cell_final}")
+    print(f"Energy change: {e_final - e_init:.4f} eV")
+    
+    return atoms
+
+
+def check_pme_contribution(atoms, calc_pme):
+    """
+    Print detailed energy breakdown for MACE+PME calculator.
+    """
+    print(f"\n{'='*40}")
+    print("PME Energy Contribution Check")
+    print(f"{'='*40}")
+    
+    atoms = atoms.copy()
+    atoms.calc = calc_pme
+    
+    # Get total energy (triggers calculation)
+    e_total = atoms.get_potential_energy()
+    
+    # Access stored components
+    e_mace = calc_pme.results.get('energy_mace', 'N/A')
+    e_pme = calc_pme.results.get('energy_pme', 'N/A')
+    
+    print(f"Total energy:  {e_total:.6f} eV")
+    print(f"MACE energy:   {e_mace:.6f} eV")
+    print(f"PME energy:    {e_pme:.6f} eV")
+    print(f"PME fraction:  {abs(e_pme/e_total)*100:.2f} %")
+    
+    # Estimate Madelung energy for comparison
+    # E_Madelung = -α * e^2 / (4πε₀ * r_0) * N_pairs
+    # For NaCl: α ≈ 1.7476 (Madelung constant)
+    # Rough estimate for 2 atoms: ~ -8.9 eV per formula unit
+    print(f"\n(Reference: NaCl Madelung energy ~ -8.9 eV/f.u.)")
+    
+    return e_mace, e_pme
+
+
 def main():
     """Main workflow"""
     
@@ -295,44 +364,91 @@ def main():
             device=device
         )
         
-        # MACE + PME
+        # MACE + PME (verbose for debugging during optimization)
+        calc_pme_verbose = MACEPMECalculator(
+            mace_model='mace-omat-0-medium',
+            charges=NACL_CHARGES,
+            pme_cutoff=12.0,
+            device=device,
+            verbose=True  # Show energy breakdown
+        )
+        
+        # MACE + PME (quiet for phonon calculation)
         calc_pme = MACEPMECalculator(
             mace_model='mace-omat-0-medium',
             charges=NACL_CHARGES,
             pme_cutoff=12.0,
-            device=device
+            device=device,
+            verbose=False
         )
         
     except ImportError as e:
         print(f"\nError importing calculators: {e}")
         print("Creating mock results for demonstration...")
-        
-        # Create mock results for visualization
         return create_mock_comparison()
     
-    # Calculate phonons
-    print("\n" + "=" * 40)
-    print("Calculating MACE-only phonons...")
-    print("=" * 40)
-    results_mace = calculate_phonons(nacl.copy(), calc_mace, 'mace_only')
+    # ============================================
+    # Step 1: Check PME contribution before optimization
+    # ============================================
+    print("\n" + "=" * 60)
+    print("STEP 1: Check PME contribution (before optimization)")
+    print("=" * 60)
+    check_pme_contribution(nacl.copy(), calc_pme_verbose)
     
-    print("\n" + "=" * 40)
-    print("Calculating MACE+PME phonons...")
-    print("=" * 40)
-    results_pme = calculate_phonons(nacl.copy(), calc_pme, 'mace_pme')
+    # ============================================
+    # Step 2: Optimize structures
+    # ============================================
+    print("\n" + "=" * 60)
+    print("STEP 2: Structure Optimization")
+    print("=" * 60)
     
-    # Analyze Γ point
-    print("\n" + "=" * 40)
-    print("Analysis at Γ point")
-    print("=" * 40)
+    nacl_opt_mace = optimize_structure(nacl.copy(), calc_mace, 'mace_only')
+    nacl_opt_pme = optimize_structure(nacl.copy(), calc_pme_verbose, 'mace_pme')
+    
+    # Compare optimized lattice constants
+    print(f"\n{'='*40}")
+    print("Optimized lattice constants comparison:")
+    print(f"  MACE only:  {nacl_opt_mace.cell.lengths()[0]:.4f} Å")
+    print(f"  MACE + PME: {nacl_opt_pme.cell.lengths()[0]:.4f} Å")
+    print(f"  Experiment: {NACL_LATTICE:.4f} Å")
+    
+    # ============================================
+    # Step 3: Check PME contribution after optimization
+    # ============================================
+    print("\n" + "=" * 60)
+    print("STEP 3: Check PME contribution (after optimization)")
+    print("=" * 60)
+    check_pme_contribution(nacl_opt_pme, calc_pme_verbose)
+    
+    # ============================================
+    # Step 4: Calculate phonons
+    # ============================================
+    print("\n" + "=" * 60)
+    print("STEP 4: Phonon Calculations")
+    print("=" * 60)
+    
+    print("\nCalculating MACE-only phonons...")
+    results_mace = calculate_phonons(nacl_opt_mace, calc_mace, 'mace_only')
+    
+    print("\nCalculating MACE+PME phonons...")
+    results_pme = calculate_phonons(nacl_opt_pme, calc_pme, 'mace_pme')
+    
+    # ============================================
+    # Step 5: Analysis
+    # ============================================
+    print("\n" + "=" * 60)
+    print("STEP 5: Analysis at Γ point")
+    print("=" * 60)
     
     analyze_gamma_splitting(results_mace, "MACE only")
     analyze_gamma_splitting(results_pme, "MACE + PME")
     
-    # Plot comparison
-    print("\n" + "=" * 40)
-    print("Generating comparison plot...")
-    print("=" * 40)
+    # ============================================
+    # Step 6: Generate plots
+    # ============================================
+    print("\n" + "=" * 60)
+    print("STEP 6: Generating comparison plot")
+    print("=" * 60)
     
     output_file = plot_comparison(results_mace, results_pme)
     
