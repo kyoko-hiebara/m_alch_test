@@ -21,6 +21,11 @@ from ase.build import bulk
 from ase.phonons import Phonons
 from ase.dft.kpoints import bandpath
 
+# Unit conversion: eV to THz
+# ω (THz) = E (eV) / ℏ, where ℏ = 4.136e-15 eV·s
+# So: ω (THz) = E (eV) × 241.799 THz/eV
+EV_TO_THZ = 241.799
+
 # Configuration
 SUPERCELL = (3, 3, 3)  # 3x3x3 supercell for phonons
 DELTA = 0.01  # Finite displacement in Angstrom
@@ -84,13 +89,8 @@ def calculate_phonons(atoms, calc, name, supercell=SUPERCELL, delta=DELTA):
     # Get band structure
     bs = ph.get_band_structure(path)
     
-    # Extract frequencies
-    frequencies = bs.energies  # Shape: (n_kpts, n_bands)
-    
-    # Convert to THz (ASE gives eV by default for phonons? Check units)
-    # Actually ASE phonons gives frequencies in eV, need to convert
-    # ω (THz) = E (eV) / h (eV·s) where h = 4.136e-15 eV·s
-    # So ω (THz) = E (meV) * 0.2418
+    # Note: bs.energies is in eV, convert to THz when plotting/analyzing
+    # ω (THz) = E (eV) × 241.799
     
     # Clean up
     ph.clean()
@@ -98,7 +98,7 @@ def calculate_phonons(atoms, calc, name, supercell=SUPERCELL, delta=DELTA):
     return {
         'path': path,
         'band_structure': bs,
-        'frequencies_eV': frequencies,
+        'frequencies_eV': bs.energies,
         'special_points': path.special_points,
     }
 
@@ -112,21 +112,66 @@ def plot_comparison(results_mace, results_pme, output_file='nacl_phonon_comparis
     
     titles = ['MACE only', 'MACE + PME (Long-range Coulomb)']
     results_list = [results_mace, results_pme]
+    colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown']
     
     for ax, results, title in zip(axes, results_list, titles):
         bs = results['band_structure']
+        path = results['path']
         
-        # Plot band structure
-        bs.plot(ax=ax)
+        # Get energies in eV and convert to THz
+        freqs_eV = bs.energies  # Shape: (n_kpts, n_bands)
+        freqs_THz = freqs_eV * EV_TO_THZ
+        
+        # Get x-axis (k-point path)
+        # Use normalized path distance
+        kpts = path.kpts
+        n_kpts = len(kpts)
+        x = np.linspace(0, 1, n_kpts)
+        
+        # Plot each band
+        n_bands = freqs_THz.shape[1]
+        for i in range(n_bands):
+            ax.plot(x, freqs_THz[:, i], '-', color=colors[i % len(colors)], 
+                    alpha=0.8, linewidth=1.5)
         
         ax.set_title(title, fontsize=14)
         ax.set_ylabel('Frequency (THz)' if ax == axes[0] else '')
-        ax.set_ylim(0, None)
+        ax.set_xlabel('Wave vector')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 10)  # NaCl optical modes are 5-8 THz
         ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
         
         # Add experimental reference lines for LO-TO at Gamma
-        ax.axhline(y=5.0, color='blue', linestyle=':', alpha=0.5, label='TO exp (~5 THz)')
-        ax.axhline(y=8.0, color='red', linestyle=':', alpha=0.5, label='LO exp (~8 THz)')
+        ax.axhline(y=5.0, color='green', linestyle=':', alpha=0.7, 
+                   label='TO exp (~5 THz)')
+        ax.axhline(y=8.0, color='red', linestyle=':', alpha=0.7, 
+                   label='LO exp (~8 THz)')
+        
+        # Mark special points
+        special_points = path.special_points
+        special_x = []
+        special_labels = []
+        
+        # Get special point positions
+        for name, kpt in special_points.items():
+            # Find closest k-point
+            distances = np.linalg.norm(kpts - kpt, axis=1)
+            idx = np.argmin(distances)
+            special_x.append(x[idx])
+            # Use Γ symbol for gamma
+            label = 'Γ' if name.lower() in ['g', 'gamma'] else name
+            special_labels.append(label)
+        
+        # Sort by x position
+        sorted_pairs = sorted(zip(special_x, special_labels))
+        special_x = [p[0] for p in sorted_pairs]
+        special_labels = [p[1] for p in sorted_pairs]
+        
+        ax.set_xticks(special_x)
+        ax.set_xticklabels(special_labels)
+        
+        for sx in special_x:
+            ax.axvline(x=sx, color='gray', linestyle='-', alpha=0.3)
         
         if ax == axes[1]:
             ax.legend(loc='upper right')
@@ -153,32 +198,36 @@ def analyze_gamma_splitting(results, name):
     bs = results['band_structure']
     
     # Get frequencies at Γ (first point)
-    # Note: need to find Gamma point index in the path
-    path = results['path']
-    
-    # Find Gamma point (usually first point)
     gamma_idx = 0
-    freqs_gamma = bs.energies[gamma_idx]
+    freqs_gamma_eV = bs.energies[gamma_idx]
+    
+    # Convert eV to THz
+    freqs_gamma_THz = freqs_gamma_eV * EV_TO_THZ
     
     # Sort frequencies
-    freqs_sorted = np.sort(freqs_gamma)
+    freqs_sorted = np.sort(freqs_gamma_THz)
     
     # For NaCl (2 atoms), we have 6 modes at Gamma:
     # 3 acoustic (should be ~0)
     # 3 optical (TO + LO)
     
-    # Filter out acoustic (near zero)
-    optical_freqs = freqs_sorted[freqs_sorted > 1.0]  # THz threshold
+    # Filter out acoustic (near zero) - use 1 THz threshold
+    optical_freqs = freqs_sorted[freqs_sorted > 1.0]
     
     print(f"\n{name} - Frequencies at Γ point:")
     print(f"  All modes (THz): {freqs_sorted}")
     print(f"  Optical modes (THz): {optical_freqs}")
     
     if len(optical_freqs) >= 2:
-        # Estimate splitting (crude: max - min of optical)
-        splitting = optical_freqs[-1] - optical_freqs[0]
-        print(f"  Estimated LO-TO splitting: {splitting:.2f} THz")
-        print(f"  (Experimental: ~3 THz)")
+        # For NaCl: should have 3 optical modes (1 LO, 2 TO degenerate)
+        # Estimate splitting (max - min of optical)
+        to_freq = optical_freqs[0]  # Lowest optical = TO
+        lo_freq = optical_freqs[-1]  # Highest optical = LO
+        splitting = lo_freq - to_freq
+        
+        print(f"  TO frequency: {to_freq:.2f} THz (exp: ~5 THz)")
+        print(f"  LO frequency: {lo_freq:.2f} THz (exp: ~8 THz)")
+        print(f"  LO-TO splitting: {splitting:.2f} THz (exp: ~3 THz)")
     
     return freqs_sorted
 
