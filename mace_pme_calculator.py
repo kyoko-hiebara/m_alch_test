@@ -151,7 +151,8 @@ class MACEPMECalculator(Calculator):
         )
         
         # Compute PME
-        atom_energies, atom_forces = particle_mesh_ewald(
+        # API may return: (energies, forces) or (energies, forces, virial) etc.
+        pme_result = particle_mesh_ewald(
             positions=positions,
             charges=charges,
             cell=cell,
@@ -159,6 +160,27 @@ class MACEPMECalculator(Calculator):
             neighbor_matrix_shifts=shift_matrix,
             accuracy=self.pme_accuracy
         )
+        
+        # Debug: print what we get back
+        if not hasattr(self, '_pme_debug_printed'):
+            print(f"[DEBUG] PME returned {len(pme_result)} values")
+            for i, v in enumerate(pme_result):
+                if hasattr(v, 'shape'):
+                    print(f"  [{i}] shape={v.shape}, dtype={v.dtype}")
+                else:
+                    print(f"  [{i}] type={type(v)}")
+            self._pme_debug_printed = True
+        
+        # Handle different return formats
+        if isinstance(pme_result, tuple):
+            if len(pme_result) >= 2:
+                atom_energies = pme_result[0]
+                atom_forces = pme_result[1]
+            else:
+                raise ValueError(f"Unexpected PME result format: {len(pme_result)} values")
+        else:
+            # Single return value (dict or similar)
+            raise ValueError(f"Unexpected PME result type: {type(pme_result)}")
         
         # Convert to numpy
         energy = atom_energies.sum().item()
