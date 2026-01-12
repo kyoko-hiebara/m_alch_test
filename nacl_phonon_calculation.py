@@ -89,8 +89,13 @@ def calculate_phonons(atoms, calc, name, supercell=SUPERCELL, delta=DELTA):
     # Get band structure
     bs = ph.get_band_structure(path)
     
-    # Note: bs.energies is in eV, convert to THz when plotting/analyzing
-    # ω (THz) = E (eV) × 241.799
+    # Store frequencies directly (bs object might change after clean)
+    frequencies_eV = np.array(bs.energies).copy()
+    
+    # Debug: check actual data format
+    print(f"[DEBUG] Band structure info for {name}:")
+    print(f"  frequencies_eV.shape = {frequencies_eV.shape}")
+    print(f"  path.kpts.shape = {path.kpts.shape}")
     
     # Clean up
     ph.clean()
@@ -98,7 +103,7 @@ def calculate_phonons(atoms, calc, name, supercell=SUPERCELL, delta=DELTA):
     return {
         'path': path,
         'band_structure': bs,
-        'frequencies_eV': bs.energies,
+        'frequencies_eV': frequencies_eV,  # Use stored copy
         'special_points': path.special_points,
     }
 
@@ -115,68 +120,88 @@ def plot_comparison(results_mace, results_pme, output_file='nacl_phonon_comparis
     colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown']
     
     for ax, results, title in zip(axes, results_list, titles):
-        bs = results['band_structure']
         path = results['path']
         
-        # Get energies in eV and convert to THz
-        freqs_eV = bs.energies  # Shape: (n_kpts, n_bands)
+        # Use stored frequencies (not bs.energies which might be stale)
+        freqs_eV = results['frequencies_eV']
+        print(f"[DEBUG] {title}: freqs_eV.shape = {freqs_eV.shape}, ndim = {freqs_eV.ndim}")
+        
+        # ASE BandStructure might have shape:
+        # (n_spins, n_kpts, n_bands) - electronic
+        # (n_kpts, n_bands) - phonons
+        # Handle both cases
+        if freqs_eV.ndim == 3:
+            # Has spin dimension, take first
+            freqs_eV = freqs_eV[0]
+        
         freqs_THz = freqs_eV * EV_TO_THZ
         
-        # Get x-axis (k-point path)
-        # Use normalized path distance
-        kpts = path.kpts
-        n_kpts = len(kpts)
-        x = np.linspace(0, 1, n_kpts)
+        # Ensure 2D
+        if freqs_THz.ndim == 1:
+            freqs_THz = freqs_THz.reshape(1, -1)
+        
+        n_kpts, n_bands = freqs_THz.shape
+        print(f"[DEBUG] After reshape: n_kpts={n_kpts}, n_bands={n_bands}")
+        
+        # Get x-axis
+        if n_kpts > 1:
+            x = np.linspace(0, 1, n_kpts)
+        else:
+            x = np.array([0.0])
         
         # Plot each band
-        n_bands = freqs_THz.shape[1]
         for i in range(n_bands):
-            ax.plot(x, freqs_THz[:, i], '-', color=colors[i % len(colors)], 
-                    alpha=0.8, linewidth=1.5)
+            if n_kpts > 1:
+                ax.plot(x, freqs_THz[:, i], '-', color=colors[i % len(colors)], 
+                        alpha=0.8, linewidth=1.5)
+            else:
+                # Single point - plot as horizontal line or marker
+                ax.axhline(y=freqs_THz[0, i], color=colors[i % len(colors)],
+                          alpha=0.8, linewidth=1.5, linestyle='--')
         
         ax.set_title(title, fontsize=14)
         ax.set_ylabel('Frequency (THz)' if ax == axes[0] else '')
         ax.set_xlabel('Wave vector')
         ax.set_xlim(0, 1)
-        ax.set_ylim(0, 10)  # NaCl optical modes are 5-8 THz
+        ax.set_ylim(0, 10)
         ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
         
-        # Add experimental reference lines for LO-TO at Gamma
+        # Reference lines
         ax.axhline(y=5.0, color='green', linestyle=':', alpha=0.7, 
                    label='TO exp (~5 THz)')
         ax.axhline(y=8.0, color='red', linestyle=':', alpha=0.7, 
                    label='LO exp (~8 THz)')
         
-        # Mark special points
-        special_points = path.special_points
-        special_x = []
-        special_labels = []
-        
-        # Get special point positions
-        for name, kpt in special_points.items():
-            # Find closest k-point
-            distances = np.linalg.norm(kpts - kpt, axis=1)
-            idx = np.argmin(distances)
-            special_x.append(x[idx])
-            # Use Γ symbol for gamma
-            label = 'Γ' if name.lower() in ['g', 'gamma'] else name
-            special_labels.append(label)
-        
-        # Sort by x position
-        sorted_pairs = sorted(zip(special_x, special_labels))
-        special_x = [p[0] for p in sorted_pairs]
-        special_labels = [p[1] for p in sorted_pairs]
-        
-        ax.set_xticks(special_x)
-        ax.set_xticklabels(special_labels)
-        
-        for sx in special_x:
-            ax.axvline(x=sx, color='gray', linestyle='-', alpha=0.3)
+        # Special points
+        if n_kpts > 1:
+            special_points = path.special_points
+            kpts = path.kpts
+            special_x = []
+            special_labels = []
+            
+            for name, kpt in special_points.items():
+                distances = np.linalg.norm(kpts - kpt, axis=1)
+                idx = np.argmin(distances)
+                special_x.append(x[idx])
+                label = 'Γ' if name.lower() in ['g', 'gamma'] else name
+                special_labels.append(label)
+            
+            sorted_pairs = sorted(zip(special_x, special_labels))
+            special_x = [p[0] for p in sorted_pairs]
+            special_labels = [p[1] for p in sorted_pairs]
+            
+            ax.set_xticks(special_x)
+            ax.set_xticklabels(special_labels)
+            
+            for sx in special_x:
+                ax.axvline(x=sx, color='gray', linestyle='-', alpha=0.3)
+        else:
+            ax.set_xticks([0, 0.5, 1])
+            ax.set_xticklabels(['Γ', '', 'X'])
         
         if ax == axes[1]:
             ax.legend(loc='upper right')
     
-    # Add annotation about LO-TO splitting
     fig.suptitle(
         'NaCl Phonon Dispersion: Effect of Long-range Electrostatics on LO-TO Splitting',
         fontsize=14, fontweight='bold'
@@ -195,11 +220,18 @@ def analyze_gamma_splitting(results, name):
     Analyze frequencies at Γ point to quantify LO-TO splitting.
     """
     
-    bs = results['band_structure']
+    # Use stored frequencies
+    freqs_eV = results['frequencies_eV']
+    
+    print(f"\n[DEBUG] analyze {name}: freqs_eV.shape = {freqs_eV.shape}")
+    
+    # Handle different shapes
+    if freqs_eV.ndim == 3:
+        freqs_eV = freqs_eV[0]  # Remove spin dimension
     
     # Get frequencies at Γ (first point)
     gamma_idx = 0
-    freqs_gamma_eV = bs.energies[gamma_idx]
+    freqs_gamma_eV = freqs_eV[gamma_idx]
     
     # Convert eV to THz
     freqs_gamma_THz = freqs_gamma_eV * EV_TO_THZ
