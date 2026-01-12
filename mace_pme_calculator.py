@@ -4,12 +4,18 @@ MACE + PME Combined Calculator for ASE
 
 Combines MACE with long-range electrostatics via nvalchemiops PME
 to investigate LO-TO splitting in ionic systems like NaCl.
+
+NOTE: nvalchemiops PME returns energy in Rydberg units!
+      Must convert to eV: E(eV) = E(Ry) × 13.606
 """
 
 import torch
 import numpy as np
 from ase.calculators.calculator import Calculator, all_changes
 from typing import Dict, Optional
+
+# Unit conversion: Rydberg to eV
+RY_TO_EV = 13.606
 
 
 class MACEPMECalculator(Calculator):
@@ -126,9 +132,10 @@ class MACEPMECalculator(Calculator):
         # With compute_forces=True, returns (energies, forces)
         atom_energies, atom_forces = pme_result
         
-        # Convert to numpy
-        energy = atom_energies.sum().item()
-        forces = atom_forces.detach().cpu().numpy()
+        # Convert from Rydberg to eV
+        # nvalchemiops PME returns energy in Rydberg units!
+        energy = atom_energies.sum().item() * RY_TO_EV
+        forces = atom_forces.detach().cpu().numpy() * RY_TO_EV  # Force also in Ry/Å → eV/Å
         
         return energy, forces
     
