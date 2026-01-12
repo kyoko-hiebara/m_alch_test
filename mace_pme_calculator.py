@@ -372,13 +372,13 @@ def main():
         
         # MACE only
         calc_mace = MACEOnlyCalculator(
-            mace_model='mace-omat-0-medium',
+            mace_model='medium-omat-0',
             device=device
         )
         
         # MACE + PME (verbose for debugging during optimization)
         calc_pme_verbose = MACEPMECalculator(
-            mace_model='mace-omat-0-medium',
+            mace_model='medium-omat-0',
             charges=NACL_CHARGES,
             pme_cutoff=12.0,
             device=device,
@@ -387,7 +387,7 @@ def main():
         
         # MACE + PME (quiet for phonon calculation)
         calc_pme = MACEPMECalculator(
-            mace_model='mace-omat-0-medium',
+            mace_model='medium-omat-0',
             charges=NACL_CHARGES,
             pme_cutoff=12.0,
             device=device,
