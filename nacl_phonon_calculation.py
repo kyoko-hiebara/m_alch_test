@@ -28,6 +28,11 @@ NACL_LATTICE = 5.64
 # NaCl charges
 NACL_CHARGES = {'Na': 1.0, 'Cl': -1.0}
 
+# PME scaling factor (reduce double counting with MACE)
+# 1.0 = full PME, 0.0 = no PME
+# Try values like 0.1-0.3 to find balance
+PME_SCALE = 0.1
+
 
 def get_strain_filter():
     """Get appropriate filter for cell optimization based on ASE version."""
@@ -105,6 +110,7 @@ def check_pme_contribution(atoms, calc_pme):
         print(f"PME fraction:  {abs(e_pme/e_total)*100:.2f} %")
     
     print(f"\n(Reference: NaCl Madelung energy ~ -8.9 eV/f.u.)")
+    print(f"(With PME_SCALE={PME_SCALE}: expected PME ~ {-8.9*PME_SCALE:.2f} eV)")
     
     return e_mace, e_pme
 
@@ -294,6 +300,7 @@ def main():
         mace_model='mace-omat-0-medium',
         charges=NACL_CHARGES,
         pme_cutoff=12.0,
+        pme_scale=PME_SCALE,
         device=device,
         verbose=True
     )
@@ -302,9 +309,12 @@ def main():
         mace_model='mace-omat-0-medium',
         charges=NACL_CHARGES,
         pme_cutoff=12.0,
+        pme_scale=PME_SCALE,
         device=device,
         verbose=False
     )
+    
+    print(f"PME scale factor: {PME_SCALE}")
     
     # Step 1: Check PME contribution before optimization
     print("\n" + "=" * 60)
