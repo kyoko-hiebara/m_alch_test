@@ -37,6 +37,7 @@ class MACEPMECalculator(Calculator):
         pme_accuracy: float = 1e-6,
         device: str = 'cuda',
         default_dtype: str = 'float32',
+        verbose: bool = False,
         **kwargs
     ):
         """
@@ -52,6 +53,8 @@ class MACEPMECalculator(Calculator):
             Target accuracy for PME calculation
         device : str
             'cuda' or 'cpu'
+        verbose : bool
+            Print energy breakdown on each calculation
         """
         super().__init__(**kwargs)
         
@@ -59,6 +62,7 @@ class MACEPMECalculator(Calculator):
         self.pme_cutoff = pme_cutoff
         self.pme_accuracy = pme_accuracy
         self.charges_dict = charges or {}
+        self.verbose = verbose
         
         # Set default dtype
         if default_dtype == 'float32':
@@ -209,6 +213,14 @@ class MACEPMECalculator(Calculator):
         # Store components for analysis
         self.results['energy_mace'] = e_mace
         self.results['energy_pme'] = e_pme
+        
+        # Verbose output
+        if self.verbose:
+            print(f"[MACE+PME] E_total={e_mace + e_pme:.6f} eV "
+                  f"(MACE={e_mace:.6f}, PME={e_pme:.6f})")
+            f_max_mace = np.abs(f_mace).max()
+            f_max_pme = np.abs(f_pme).max()
+            print(f"[MACE+PME] F_max: MACE={f_max_mace:.6f}, PME={f_max_pme:.6f} eV/Å")
         
         if 'stress' in properties and 'stress' in self.mace.results:
             # For now, just use MACE stress (PME stress needs more work)
