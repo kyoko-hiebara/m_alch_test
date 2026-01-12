@@ -5,8 +5,9 @@ MACE + PME Combined Calculator for ASE
 Combines MACE with long-range electrostatics via nvalchemiops PME
 to investigate LO-TO splitting in ionic systems like NaCl.
 
-NOTE: nvalchemiops PME returns energy in Rydberg units!
-      Must convert to eV: E(eV) = E(Ry) × 13.606
+NOTE: nvalchemiops PME assumes k_e = 1 (atomic units).
+      For eV-Å system, multiply by Coulomb constant:
+      k_e = e²/(4πε₀) = 14.3996 eV·Å
 """
 
 import torch
@@ -14,16 +15,22 @@ import numpy as np
 from ase.calculators.calculator import Calculator, all_changes
 from typing import Dict, Optional
 
-# Unit conversion: Rydberg to eV
-RY_TO_EV = 13.606
+# Coulomb constant for eV-Å system
+# k_e = e²/(4πε₀) in eV·Å
+COULOMB_CONST = 14.3996
 
 
 class MACEPMECalculator(Calculator):
     """
     ASE Calculator combining MACE with Particle Mesh Ewald electrostatics.
     
-    E_total = E_MACE + E_PME
-    F_total = F_MACE + F_PME
+    E_total = E_MACE + pme_scale * E_PME
+    F_total = F_MACE + pme_scale * F_PME
+    
+    Note on double counting:
+    MACE implicitly learns short-range Coulomb from DFT training data.
+    Adding full PME causes double counting of short-range part.
+    Use pme_scale < 1.0 to mitigate, or ideally subtract short-range PME.
     """
     
     implemented_properties = ['energy', 'forces', 'stress']
@@ -34,16 +41,26 @@ class MACEPMECalculator(Calculator):
         charges: Optional[Dict[str, float]] = None,
         pme_cutoff: float = 12.0,
         pme_accuracy: float = 1e-6,
+        pme_scale: float = 1.0,
         device: str = 'cuda',
         default_dtype: str = 'float32',
         verbose: bool = False,
         **kwargs
     ):
+        """
+        Parameters
+        ----------
+        pme_scale : float
+            Scaling factor for PME contribution (0-1).
+            Use < 1.0 to reduce double counting with MACE.
+            Default 1.0 = full PME.
+        """
         super().__init__(**kwargs)
         
         self.device = device
         self.pme_cutoff = pme_cutoff
         self.pme_accuracy = pme_accuracy
+        self.pme_scale = pme_scale
         self.charges_dict = charges or {}
         self.verbose = verbose
         
@@ -132,10 +149,10 @@ class MACEPMECalculator(Calculator):
         # With compute_forces=True, returns (energies, forces)
         atom_energies, atom_forces = pme_result
         
-        # Convert from Rydberg to eV
-        # nvalchemiops PME returns energy in Rydberg units!
-        energy = atom_energies.sum().item() * RY_TO_EV
-        forces = atom_forces.detach().cpu().numpy() * RY_TO_EV  # Force also in Ry/Å → eV/Å
+        # Convert from atomic units (k_e=1) to eV-Å system
+        # Multiply by Coulomb constant k_e = 14.3996 eV·Å
+        energy = atom_energies.sum().item() * COULOMB_CONST
+        forces = atom_forces.detach().cpu().numpy() * COULOMB_CONST
         
         return energy, forces
     
@@ -157,6 +174,9 @@ class MACEPMECalculator(Calculator):
         # Get PME results
         if self.charges_dict:
             e_pme, f_pme = self._compute_pme(atoms)
+            # Apply scaling factor
+            e_pme *= self.pme_scale
+            f_pme *= self.pme_scale
         else:
             e_pme = 0.0
             f_pme = np.zeros_like(f_mace)
