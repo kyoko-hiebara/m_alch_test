@@ -1,577 +1,199 @@
 """
-NaCl Phonon Calculation: MACE vs MACE+PME
-=========================================
+MACE + PME Combined Calculator for ASE
+=====================================
 
-Compare phonon dispersion of NaCl with and without long-range
-electrostatics to observe LO-TO splitting.
-
-Expected: MACE alone will miss LO-TO splitting at Γ point,
-while MACE+PME should recover it.
-
-Experimental values for NaCl at Γ:
-- TO: ~5 THz (167 cm⁻¹)
-- LO: ~8 THz (267 cm⁻¹)
-- Splitting: ~3 THz (100 cm⁻¹)
+Combines MACE with long-range electrostatics via nvalchemiops PME
+to investigate LO-TO splitting in ionic systems like NaCl.
 """
 
+import torch
 import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-from ase.build import bulk
-from ase.phonons import Phonons
-from ase.dft.kpoints import bandpath
-
-# Unit conversion: eV to THz
-# ω (THz) = E (eV) / ℏ, where ℏ = 4.136e-15 eV·s
-# So: ω (THz) = E (eV) × 241.799 THz/eV
-EV_TO_THZ = 241.799
-
-# Configuration
-SUPERCELL = (3, 3, 3)  # 3x3x3 supercell for phonons
-DELTA = 0.01  # Finite displacement in Angstrom
-NACL_LATTICE = 5.64  # Experimental lattice constant in Angstrom
-
-# NaCl charges
-NACL_CHARGES = {'Na': 1.0, 'Cl': -1.0}
+from ase.calculators.calculator import Calculator, all_changes
+from typing import Dict, Optional
 
 
-def create_nacl():
-    """Create NaCl primitive cell"""
-    nacl = bulk('NaCl', 'rocksalt', a=NACL_LATTICE)
-    return nacl
-
-
-def calculate_phonons(atoms, calc, name, supercell=SUPERCELL, delta=DELTA):
+class MACEPMECalculator(Calculator):
     """
-    Calculate phonon band structure using finite displacements.
+    ASE Calculator combining MACE with Particle Mesh Ewald electrostatics.
     
-    Parameters
-    ----------
-    atoms : ase.Atoms
-        Primitive cell
-    calc : Calculator
-        ASE calculator
-    name : str
-        Name for saving files
-    supercell : tuple
-        Supercell size for force constants
-    delta : float
-        Displacement magnitude in Angstrom
-        
-    Returns
-    -------
-    band_structure : dict
-        Contains 'path', 'frequencies', 'special_points'
+    E_total = E_MACE + E_PME
+    F_total = F_MACE + F_PME
     """
     
-    workdir = Path(f'phonon_{name}')
-    workdir.mkdir(exist_ok=True)
+    implemented_properties = ['energy', 'forces', 'stress']
     
-    # Set calculator
-    atoms.calc = calc
-    
-    # Initialize phonon calculation
-    ph = Phonons(atoms, calc, supercell=supercell, delta=delta, name=str(workdir / name))
-    
-    # Run force calculations (this takes time)
-    print(f"Running phonon calculations for {name}...")
-    print(f"  Supercell: {supercell}")
-    print(f"  Displacement: {delta} Å")
-    
-    ph.run()
-    
-    # Read forces and assemble dynamical matrix
-    ph.read(acoustic=True)
-    
-    # Define path in BZ: Γ-X-K-Γ-L
-    path = atoms.cell.bandpath('GXKGL', npoints=100)
-    
-    # Get band structure
-    bs = ph.get_band_structure(path)
-    
-    # Store frequencies directly (bs object might change after clean)
-    frequencies_eV = np.array(bs.energies).copy()
-    
-    # Debug: check actual data format
-    print(f"[DEBUG] Band structure info for {name}:")
-    print(f"  frequencies_eV.shape = {frequencies_eV.shape}")
-    print(f"  path.kpts.shape = {path.kpts.shape}")
-    
-    # Clean up
-    ph.clean()
-    
-    return {
-        'path': path,
-        'band_structure': bs,
-        'frequencies_eV': frequencies_eV,  # Use stored copy
-        'special_points': path.special_points,
-    }
-
-
-def plot_comparison(results_mace, results_pme, output_file='nacl_phonon_comparison.png'):
-    """
-    Plot phonon bands comparing MACE vs MACE+PME
-    """
-    
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
-    
-    titles = ['MACE only', 'MACE + PME (Long-range Coulomb)']
-    results_list = [results_mace, results_pme]
-    colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown']
-    
-    for ax, results, title in zip(axes, results_list, titles):
-        path = results['path']
+    def __init__(
+        self,
+        mace_model: str = "medium-omat-0",
+        charges: Optional[Dict[str, float]] = None,
+        pme_cutoff: float = 12.0,
+        pme_accuracy: float = 1e-6,
+        device: str = 'cuda',
+        default_dtype: str = 'float32',
+        verbose: bool = False,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
         
-        # Use stored frequencies (not bs.energies which might be stale)
-        freqs_eV = results['frequencies_eV']
-        print(f"[DEBUG] {title}: freqs_eV.shape = {freqs_eV.shape}, ndim = {freqs_eV.ndim}")
+        self.device = device
+        self.pme_cutoff = pme_cutoff
+        self.pme_accuracy = pme_accuracy
+        self.charges_dict = charges or {}
+        self.verbose = verbose
         
-        # ASE BandStructure might have shape:
-        # (n_spins, n_kpts, n_bands) - electronic
-        # (n_kpts, n_bands) - phonons
-        # Handle both cases
-        if freqs_eV.ndim == 3:
-            # Has spin dimension, take first
-            freqs_eV = freqs_eV[0]
-        
-        freqs_THz = freqs_eV * EV_TO_THZ
-        
-        # Ensure 2D
-        if freqs_THz.ndim == 1:
-            freqs_THz = freqs_THz.reshape(1, -1)
-        
-        n_kpts, n_bands = freqs_THz.shape
-        print(f"[DEBUG] After reshape: n_kpts={n_kpts}, n_bands={n_bands}")
-        
-        # Get x-axis
-        if n_kpts > 1:
-            x = np.linspace(0, 1, n_kpts)
+        if default_dtype == 'float32':
+            torch.set_default_dtype(torch.float32)
         else:
-            x = np.array([0.0])
+            torch.set_default_dtype(torch.float64)
         
-        # Plot each band
-        for i in range(n_bands):
-            if n_kpts > 1:
-                ax.plot(x, freqs_THz[:, i], '-', color=colors[i % len(colors)], 
-                        alpha=0.8, linewidth=1.5)
-            else:
-                # Single point - plot as horizontal line or marker
-                ax.axhline(y=freqs_THz[0, i], color=colors[i % len(colors)],
-                          alpha=0.8, linewidth=1.5, linestyle='--')
+        self._init_mace(mace_model)
         
-        ax.set_title(title, fontsize=14)
-        ax.set_ylabel('Frequency (THz)' if ax == axes[0] else '')
-        ax.set_xlabel('Wave vector')
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 10)
-        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-        
-        # Reference lines
-        ax.axhline(y=5.0, color='green', linestyle=':', alpha=0.7, 
-                   label='TO exp (~5 THz)')
-        ax.axhline(y=8.0, color='red', linestyle=':', alpha=0.7, 
-                   label='LO exp (~8 THz)')
-        
-        # Special points
-        if n_kpts > 1:
-            special_points = path.special_points
-            kpts = path.kpts
-            special_x = []
-            special_labels = []
-            
-            for name, kpt in special_points.items():
-                distances = np.linalg.norm(kpts - kpt, axis=1)
-                idx = np.argmin(distances)
-                special_x.append(x[idx])
-                label = 'Γ' if name.lower() in ['g', 'gamma'] else name
-                special_labels.append(label)
-            
-            sorted_pairs = sorted(zip(special_x, special_labels))
-            special_x = [p[0] for p in sorted_pairs]
-            special_labels = [p[1] for p in sorted_pairs]
-            
-            ax.set_xticks(special_x)
-            ax.set_xticklabels(special_labels)
-            
-            for sx in special_x:
-                ax.axvline(x=sx, color='gray', linestyle='-', alpha=0.3)
-        else:
-            ax.set_xticks([0, 0.5, 1])
-            ax.set_xticklabels(['Γ', '', 'X'])
-        
-        if ax == axes[1]:
-            ax.legend(loc='upper right')
-    
-    fig.suptitle(
-        'NaCl Phonon Dispersion: Effect of Long-range Electrostatics on LO-TO Splitting',
-        fontsize=14, fontweight='bold'
-    )
-    
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Saved: {output_file}")
-    return output_file
-
-
-def analyze_gamma_splitting(results, name):
-    """
-    Analyze frequencies at Γ point to quantify LO-TO splitting.
-    """
-    
-    # Use stored frequencies
-    freqs_eV = results['frequencies_eV']
-    
-    print(f"\n[DEBUG] analyze {name}: freqs_eV.shape = {freqs_eV.shape}")
-    
-    # Handle different shapes
-    if freqs_eV.ndim == 3:
-        freqs_eV = freqs_eV[0]  # Remove spin dimension
-    
-    # Get frequencies at Γ (first point)
-    gamma_idx = 0
-    freqs_gamma_eV = freqs_eV[gamma_idx]
-    
-    # Convert eV to THz
-    freqs_gamma_THz = freqs_gamma_eV * EV_TO_THZ
-    
-    # Sort frequencies
-    freqs_sorted = np.sort(freqs_gamma_THz)
-    
-    # For NaCl (2 atoms), we have 6 modes at Gamma:
-    # 3 acoustic (should be ~0)
-    # 3 optical (TO + LO)
-    
-    # Filter out acoustic (near zero) - use 1 THz threshold
-    optical_freqs = freqs_sorted[freqs_sorted > 1.0]
-    
-    print(f"\n{name} - Frequencies at Γ point:")
-    print(f"  All modes (THz): {freqs_sorted}")
-    print(f"  Optical modes (THz): {optical_freqs}")
-    
-    if len(optical_freqs) >= 2:
-        # For NaCl: should have 3 optical modes (1 LO, 2 TO degenerate)
-        # Estimate splitting (max - min of optical)
-        to_freq = optical_freqs[0]  # Lowest optical = TO
-        lo_freq = optical_freqs[-1]  # Highest optical = LO
-        splitting = lo_freq - to_freq
-        
-        print(f"  TO frequency: {to_freq:.2f} THz (exp: ~5 THz)")
-        print(f"  LO frequency: {lo_freq:.2f} THz (exp: ~8 THz)")
-        print(f"  LO-TO splitting: {splitting:.2f} THz (exp: ~3 THz)")
-    
-    return freqs_sorted
-
-
-def optimize_structure(atoms, calc, name, fmax=0.01):
-    """
-    Optimize atomic positions and lattice parameters.
-    
-    Returns optimized atoms copy.
-    """
-    from ase.optimize import BFGS
-    
-    # StrainFilter location varies by ASE version
-    try:
-        from ase.filters import StrainFilter
-    except ImportError:
+    def _init_mace(self, mace_model: str):
+        """Initialize MACE calculator"""
         try:
-            from ase.constraints import StrainFilter
-        except ImportError:
-            # Fallback: use ExpCellFilter or FrechetCellFilter
-            try:
-                from ase.filters import ExpCellFilter as StrainFilter
-            except ImportError:
-                from ase.filters import FrechetCellFilter as StrainFilter
+            from mace.calculators import MACECalculator
+            self.mace = MACECalculator(
+                model_paths=mace_model,
+                device=self.device,
+                default_dtype='float32'
+            )
+        except Exception as e:
+            print(f"Warning: Could not load MACE model '{mace_model}': {e}")
+            print("Falling back to MACE-MP-0 small")
+            from mace.calculators import mace_mp
+            self.mace = mace_mp(model='small', device=self.device)
     
-    print(f"\n{'='*40}")
-    print(f"Optimizing structure with {name}")
-    print(f"{'='*40}")
+    def _get_charges(self, atoms) -> torch.Tensor:
+        """Get charge tensor from atoms"""
+        charges = []
+        for symbol in atoms.get_chemical_symbols():
+            if symbol in self.charges_dict:
+                charges.append(self.charges_dict[symbol])
+            else:
+                charges.append(0.0)
+        return torch.tensor(charges, dtype=torch.float32, device=self.device)
     
-    atoms = atoms.copy()
-    atoms.calc = calc
-    
-    # Initial state
-    e_init = atoms.get_potential_energy()
-    cell_init = atoms.cell.lengths()
-    print(f"Initial energy: {e_init:.4f} eV")
-    print(f"Initial cell: {cell_init}")
-    
-    # Optimize lattice + positions using StrainFilter
-    sf = StrainFilter(atoms)
-    opt = BFGS(sf, logfile=f'opt_{name}.log')
-    opt.run(fmax=fmax)
-    
-    # Final state
-    e_final = atoms.get_potential_energy()
-    cell_final = atoms.cell.lengths()
-    print(f"Final energy: {e_final:.4f} eV")
-    print(f"Final cell: {cell_final}")
-    print(f"Energy change: {e_final - e_init:.4f} eV")
-    
-    return atoms
-
-
-def check_pme_contribution(atoms, calc_pme):
-    """
-    Print detailed energy breakdown for MACE+PME calculator.
-    """
-    print(f"\n{'='*40}")
-    print("PME Energy Contribution Check")
-    print(f"{'='*40}")
-    
-    atoms = atoms.copy()
-    atoms.calc = calc_pme
-    
-    # Get total energy (triggers calculation)
-    e_total = atoms.get_potential_energy()
-    
-    # Access stored components
-    e_mace = calc_pme.results.get('energy_mace', 'N/A')
-    e_pme = calc_pme.results.get('energy_pme', 'N/A')
-    
-    print(f"Total energy:  {e_total:.6f} eV")
-    print(f"MACE energy:   {e_mace:.6f} eV")
-    print(f"PME energy:    {e_pme:.6f} eV")
-    print(f"PME fraction:  {abs(e_pme/e_total)*100:.2f} %")
-    
-    # Estimate Madelung energy for comparison
-    # E_Madelung = -α * e^2 / (4πε₀ * r_0) * N_pairs
-    # For NaCl: α ≈ 1.7476 (Madelung constant)
-    # Rough estimate for 2 atoms: ~ -8.9 eV per formula unit
-    print(f"\n(Reference: NaCl Madelung energy ~ -8.9 eV/f.u.)")
-    
-    return e_mace, e_pme
-
-
-def main():
-    """Main workflow"""
-    
-    print("=" * 60)
-    print("NaCl Phonon Calculation: MACE vs MACE+PME")
-    print("=" * 60)
-    
-    # Create structure
-    nacl = create_nacl()
-    print(f"\nNaCl structure:")
-    print(f"  Lattice constant: {NACL_LATTICE} Å")
-    print(f"  Atoms: {nacl.get_chemical_symbols()}")
-    print(f"  Cell:\n{nacl.cell.array}")
-    
-    # Try to import calculators
-    try:
-        from mace_pme_calculator import MACEPMECalculator, MACEOnlyCalculator
-        import torch
+    def _compute_pme(self, atoms) -> tuple:
+        """Compute PME electrostatic energy and forces using nvalchemiops."""
+        from nvalchemiops.neighborlist import neighbor_list
+        from nvalchemiops.interactions.electrostatics import particle_mesh_ewald
         
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"\nUsing device: {device}")
-        
-        # Initialize calculators
-        print("\nInitializing calculators...")
-        
-        # MACE only
-        calc_mace = MACEOnlyCalculator(
-            mace_model='medium-omat-0',
-            device=device
+        # Prepare inputs
+        positions = torch.tensor(
+            atoms.positions, 
+            dtype=torch.float32, 
+            device=self.device,
+            requires_grad=True
         )
         
-        # MACE + PME (verbose for debugging during optimization)
-        calc_pme_verbose = MACEPMECalculator(
-            mace_model='medium-omat-0',
-            charges=NACL_CHARGES,
-            pme_cutoff=12.0,
-            device=device,
-            verbose=True  # Show energy breakdown
+        # Cell needs shape [num_systems, 3, 3]
+        cell = torch.tensor(
+            atoms.cell.array, 
+            dtype=torch.float32, 
+            device=self.device
+        ).unsqueeze(0)
+        
+        # PBC
+        pbc = torch.tensor(atoms.pbc, dtype=torch.bool, device=self.device)
+        
+        # Charges
+        charges = self._get_charges(atoms)
+        
+        # Skip if no charges or all zero
+        if charges.abs().sum() < 1e-10:
+            return 0.0, np.zeros((len(atoms), 3))
+        
+        # Build neighbor list for real-space PME part
+        neighbor_matrix, num_neighbors, shift_matrix = neighbor_list(
+            positions,
+            cutoff=self.pme_cutoff,
+            cell=cell,
+            pbc=pbc,
+            method="cell_list"
         )
         
-        # MACE + PME (quiet for phonon calculation)
-        calc_pme = MACEPMECalculator(
-            mace_model='medium-omat-0',
-            charges=NACL_CHARGES,
-            pme_cutoff=12.0,
-            device=device,
-            verbose=False
+        # Compute PME with forces
+        pme_result = particle_mesh_ewald(
+            positions=positions,
+            charges=charges,
+            cell=cell,
+            neighbor_matrix=neighbor_matrix,
+            neighbor_matrix_shifts=shift_matrix,
+            accuracy=self.pme_accuracy,
+            compute_forces=True
         )
         
-    except ImportError as e:
-        print(f"\nError importing calculators: {e}")
-        print("Creating mock results for demonstration...")
-        return create_mock_comparison()
+        # With compute_forces=True, returns (energies, forces)
+        atom_energies, atom_forces = pme_result
+        
+        # Convert to numpy
+        energy = atom_energies.sum().item()
+        forces = atom_forces.detach().cpu().numpy()
+        
+        return energy, forces
     
-    # ============================================
-    # Step 1: Check PME contribution before optimization
-    # ============================================
-    print("\n" + "=" * 60)
-    print("STEP 1: Check PME contribution (before optimization)")
-    print("=" * 60)
-    check_pme_contribution(nacl.copy(), calc_pme_verbose)
-    
-    # ============================================
-    # Step 2: Optimize structures
-    # ============================================
-    print("\n" + "=" * 60)
-    print("STEP 2: Structure Optimization")
-    print("=" * 60)
-    
-    nacl_opt_mace = optimize_structure(nacl.copy(), calc_mace, 'mace_only')
-    nacl_opt_pme = optimize_structure(nacl.copy(), calc_pme_verbose, 'mace_pme')
-    
-    # Compare optimized lattice constants
-    print(f"\n{'='*40}")
-    print("Optimized lattice constants comparison:")
-    print(f"  MACE only:  {nacl_opt_mace.cell.lengths()[0]:.4f} Å")
-    print(f"  MACE + PME: {nacl_opt_pme.cell.lengths()[0]:.4f} Å")
-    print(f"  Experiment: {NACL_LATTICE:.4f} Å")
-    
-    # ============================================
-    # Step 3: Check PME contribution after optimization
-    # ============================================
-    print("\n" + "=" * 60)
-    print("STEP 3: Check PME contribution (after optimization)")
-    print("=" * 60)
-    check_pme_contribution(nacl_opt_pme, calc_pme_verbose)
-    
-    # ============================================
-    # Step 4: Calculate phonons
-    # ============================================
-    print("\n" + "=" * 60)
-    print("STEP 4: Phonon Calculations")
-    print("=" * 60)
-    
-    print("\nCalculating MACE-only phonons...")
-    results_mace = calculate_phonons(nacl_opt_mace, calc_mace, 'mace_only')
-    
-    print("\nCalculating MACE+PME phonons...")
-    results_pme = calculate_phonons(nacl_opt_pme, calc_pme, 'mace_pme')
-    
-    # ============================================
-    # Step 5: Analysis
-    # ============================================
-    print("\n" + "=" * 60)
-    print("STEP 5: Analysis at Γ point")
-    print("=" * 60)
-    
-    analyze_gamma_splitting(results_mace, "MACE only")
-    analyze_gamma_splitting(results_pme, "MACE + PME")
-    
-    # ============================================
-    # Step 6: Generate plots
-    # ============================================
-    print("\n" + "=" * 60)
-    print("STEP 6: Generating comparison plot")
-    print("=" * 60)
-    
-    output_file = plot_comparison(results_mace, results_pme)
-    
-    print("\n" + "=" * 60)
-    print("Done!")
-    print("=" * 60)
-    
-    return output_file
+    def calculate(
+        self, 
+        atoms=None, 
+        properties=['energy', 'forces'],
+        system_changes=all_changes
+    ):
+        """Calculate energy and forces"""
+        
+        super().calculate(atoms, properties, system_changes)
+        
+        # Get MACE results
+        self.mace.calculate(atoms, properties)
+        e_mace = self.mace.results['energy']
+        f_mace = self.mace.results['forces']
+        
+        # Get PME results
+        if self.charges_dict:
+            e_pme, f_pme = self._compute_pme(atoms)
+        else:
+            e_pme = 0.0
+            f_pme = np.zeros_like(f_mace)
+        
+        # Combine
+        self.results['energy'] = e_mace + e_pme
+        self.results['forces'] = f_mace + f_pme
+        
+        # Store components for analysis
+        self.results['energy_mace'] = e_mace
+        self.results['energy_pme'] = e_pme
+        
+        # Verbose output
+        if self.verbose:
+            print(f"[MACE+PME] E_total={e_mace + e_pme:.6f} eV "
+                  f"(MACE={e_mace:.6f}, PME={e_pme:.6f})")
+        
+        if 'stress' in properties and 'stress' in self.mace.results:
+            self.results['stress'] = self.mace.results['stress']
 
 
-def create_mock_comparison():
-    """
-    Create mock phonon data for visualization when dependencies unavailable.
-    Shows expected behavior of LO-TO splitting.
-    """
-    import matplotlib.pyplot as plt
+class MACEOnlyCalculator(Calculator):
+    """Wrapper for MACE-only calculations (for comparison)."""
     
-    print("\nGenerating mock comparison (dependencies not available)...")
+    implemented_properties = ['energy', 'forces', 'stress']
     
-    # Create k-point path
-    npts = 100
+    def __init__(self, mace_model: str = "medium-omat-0", device: str = 'cuda', **kwargs):
+        super().__init__(**kwargs)
+        self.device = device
+        self._init_mace(mace_model)
+        
+    def _init_mace(self, mace_model: str):
+        try:
+            from mace.calculators import MACECalculator
+            self.mace = MACECalculator(
+                model_paths=mace_model,
+                device=self.device,
+                default_dtype='float32'
+            )
+        except:
+            from mace.calculators import mace_mp
+            self.mace = mace_mp(model='small', device=self.device)
     
-    # Mock frequencies for MACE only (degenerate at Gamma)
-    # Acoustic branches
-    acoustic = np.zeros((npts, 3))
-    acoustic[:, 0] = np.linspace(0, 4, npts)  # LA
-    acoustic[:, 1] = np.linspace(0, 3, npts)  # TA1
-    acoustic[:, 2] = np.linspace(0, 3, npts)  # TA2
-    
-    # Optical branches - WITHOUT splitting (MACE only)
-    optical_mace = np.zeros((npts, 3))
-    optical_mace[:, 0] = 5.5 + 0.5 * np.sin(np.linspace(0, np.pi, npts))  # TO1
-    optical_mace[:, 1] = 5.5 + 0.3 * np.sin(np.linspace(0, np.pi, npts))  # TO2
-    optical_mace[:, 2] = 5.8 + 0.5 * np.sin(np.linspace(0, np.pi, npts))  # LO (no split!)
-    
-    # Optical branches - WITH splitting (MACE + PME)
-    optical_pme = np.zeros((npts, 3))
-    optical_pme[:, 0] = 5.0 + 0.5 * np.sin(np.linspace(0, np.pi, npts))  # TO1
-    optical_pme[:, 1] = 5.0 + 0.3 * np.sin(np.linspace(0, np.pi, npts))  # TO2
-    # LO with proper splitting at Gamma
-    x = np.linspace(0, 1, npts)
-    lo_splitting = 3.0 * np.exp(-10 * x)  # Splitting decays away from Gamma
-    optical_pme[:, 2] = 5.0 + lo_splitting + 0.5 * np.sin(np.linspace(0, np.pi, npts))  # LO
-    
-    # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
-    
-    x_axis = np.linspace(0, 1, npts)
-    
-    # MACE only
-    ax = axes[0]
-    for i in range(3):
-        ax.plot(x_axis, acoustic[:, i], 'b-', alpha=0.7)
-        ax.plot(x_axis, optical_mace[:, i], 'r-', alpha=0.7)
-    
-    ax.set_title('MACE only\n(No LO-TO splitting)', fontsize=14)
-    ax.set_ylabel('Frequency (THz)', fontsize=12)
-    ax.set_xlabel('Wave vector', fontsize=12)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 10)
-    ax.axhline(y=5.0, color='gray', linestyle=':', alpha=0.5)
-    ax.axhline(y=8.0, color='gray', linestyle=':', alpha=0.5)
-    
-    # Add special points
-    ax.set_xticks([0, 0.33, 0.66, 1.0])
-    ax.set_xticklabels(['Γ', 'X', 'K', 'Γ'])
-    
-    # Annotate
-    ax.annotate('TO ≈ LO\n(degenerate)', xy=(0.02, 5.6), fontsize=10, color='red')
-    
-    # MACE + PME
-    ax = axes[1]
-    for i in range(3):
-        ax.plot(x_axis, acoustic[:, i], 'b-', alpha=0.7, label='Acoustic' if i == 0 else '')
-    for i in range(2):
-        ax.plot(x_axis, optical_pme[:, i], 'g-', alpha=0.7, label='TO' if i == 0 else '')
-    ax.plot(x_axis, optical_pme[:, 2], 'r-', alpha=0.7, label='LO')
-    
-    ax.set_title('MACE + PME\n(LO-TO splitting recovered)', fontsize=14)
-    ax.set_xlabel('Wave vector', fontsize=12)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 10)
-    
-    # Reference lines
-    ax.axhline(y=5.0, color='green', linestyle=':', alpha=0.5, label='TO exp (~5 THz)')
-    ax.axhline(y=8.0, color='red', linestyle=':', alpha=0.5, label='LO exp (~8 THz)')
-    
-    ax.set_xticks([0, 0.33, 0.66, 1.0])
-    ax.set_xticklabels(['Γ', 'X', 'K', 'Γ'])
-    
-    # Annotate splitting
-    ax.annotate('', xy=(0.02, 8.0), xytext=(0.02, 5.0),
-                arrowprops=dict(arrowstyle='<->', color='purple', lw=2))
-    ax.annotate('LO-TO\nsplit\n~3 THz', xy=(0.06, 6.5), fontsize=10, color='purple')
-    
-    ax.legend(loc='upper right', fontsize=9)
-    
-    fig.suptitle(
-        'NaCl Phonon Dispersion: Effect of Long-range Electrostatics on LO-TO Splitting\n'
-        '(Mock data for illustration)',
-        fontsize=14, fontweight='bold'
-    )
-    
-    plt.tight_layout()
-    output_file = '/home/claude/mace_pme_phonon/nacl_phonon_mock.png'
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Saved mock comparison: {output_file}")
-    return output_file
-
-
-if __name__ == "__main__":
-    output = main()
+    def calculate(self, atoms=None, properties=['energy', 'forces'], system_changes=all_changes):
+        super().calculate(atoms, properties, system_changes)
+        self.mace.calculate(atoms, properties)
+        self.results = dict(self.mace.results)
